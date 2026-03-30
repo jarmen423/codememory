@@ -978,7 +978,7 @@ Commands:
   codememory git-sync          # Sync local git history into Neo4j
   codememory git-status        # Show git graph sync status
 
-For more information, visit: https://github.com/jarmen423/agentic-memory
+For more information, visit: https://github.com/jarmen423/codememory
         """,
     )
 

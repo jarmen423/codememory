@@ -1,5 +1,5 @@
 # 🧠 Agentic Memory
-https://github.com/jarmen423/agentic-memory
+https://github.com/jarmen423/codememory
 
 > **Active, Structural Memory System for AI Coding Agents**
 
@@ -28,14 +28,14 @@ Agentic Memory is not just "RAG" for code. It is an **active, structural memory 
 
 ```bash
 # Recommended: Use pipx for isolated global installation
-pipx install agentic-memory
+pipx install agentic-codememory
 
 # Or with uv tooling
-uv tool install agentic-memory
+uv tool install agentic-codememory
 uvx codememory --help
 
 # Or use pip in a virtualenv
-pip install agentic-memory
+pip install agentic-codememory
 ```
 
 ### 2. Initialize in any repository
@@ -220,8 +220,8 @@ on all Markdown files.
 
 ```bash
 # Clone the repository
-git clone https://github.com/jarmen423/agentic-memory.git
-cd agentic-memory
+git clone https://github.com/jarmen423/codememory.git
+cd codememory
 
 # Install in editable mode
 pip install -e .

@@ -503,9 +503,10 @@ def cmd_init(args):
 def cmd_status(args):
     """Show status of Agentic Memory for the current repository."""
     repo_root, config = _resolve_repo_and_config(args, require_initialized=True)
+    repo_name = repo_root.name or str(repo_root)
 
     if not _is_json_mode(args):
-        print(f"📊 Agentic Memory Status")
+        print(f"📊 CodeMemory for {repo_name}")
         print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         print(f"Repository: {repo_root}")
         print(f"Config:     {config.config_file}")
@@ -584,13 +585,14 @@ def cmd_status(args):
             ):
                 return
 
-            print(f"\n📈 Graph Statistics:")
+            print(f"\n📈 Graph Statistics for {repo_name}:")
             print(f"   Files:     {files:,}")
             print(f"   Functions: {functions:,}")
             print(f"   Classes:   {classes:,}")
             print(f"   Chunks:    {chunks:,}")
             if last_update:
                 print(f"   Last sync: {last_update}")
+            print(f"\nℹ️ To inspect another repo, run: codememory status --repo <path>")
 
     except (neo4j.exceptions.DatabaseError, neo4j.exceptions.ServiceUnavailable) as e:
         _exit_with_error(
@@ -1231,6 +1233,11 @@ For more information, visit: https://github.com/jarmen423/codememory
 
     # Command: status
     status_parser = subparsers.add_parser("status", help="Show repository status and statistics")
+    status_parser.add_argument(
+        "--repo",
+        type=str,
+        help="Repository root path to inspect (defaults to detected current repository)",
+    )
     status_parser.add_argument(
         "--json",
         action="store_true",

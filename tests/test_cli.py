@@ -147,7 +147,7 @@ def test_status_json_success_envelope(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(cli, "Config", Mock(return_value=mock_cfg))
     monkeypatch.setattr(cli, "KnowledgeGraphBuilder", Mock(return_value=mock_builder))
 
-    cli.cmd_status(argparse.Namespace(json=True))
+    cli.cmd_status(argparse.Namespace(json=True, repo=None))
 
     payload = _parse_json_stdout(capsys)
     assert payload["ok"] is True
@@ -178,7 +178,7 @@ def test_status_json_missing_config_exits_nonzero(monkeypatch, capsys, tmp_path)
     monkeypatch.setattr(cli, "Config", Mock(return_value=mock_cfg))
 
     with pytest.raises(SystemExit) as exc:
-        cli.cmd_status(argparse.Namespace(json=True))
+        cli.cmd_status(argparse.Namespace(json=True, repo=None))
 
     assert exc.value.code == 1
     payload = _parse_json_stdout(capsys)
@@ -186,6 +186,39 @@ def test_status_json_missing_config_exits_nonzero(monkeypatch, capsys, tmp_path)
     assert payload["data"] is None
     assert payload["metrics"] == {}
     assert "not initialized" in payload["error"].lower()
+
+
+def test_status_human_output_names_active_repo(monkeypatch, capsys, tmp_path):
+    """Human status output should make the repo-scoped context explicit."""
+    repo_root = tmp_path / "m26pipeline"
+    repo_root.mkdir()
+
+    mock_cfg = _mock_config(exists=True)
+    mock_builder = Mock()
+    mock_builder.repo_id = str(repo_root.resolve())
+    session = Mock()
+    session_context = Mock()
+    session_context.__enter__ = Mock(return_value=session)
+    session_context.__exit__ = Mock(return_value=None)
+    mock_builder.driver.session.return_value = session_context
+    session.run.side_effect = [
+        _result({"count": 3}),
+        _result({"count": 7}),
+        _result({"count": 2}),
+        _result({"count": 11}),
+        _result({"last_updated": "2026-02-01T00:00:00Z"}),
+    ]
+
+    monkeypatch.setattr(cli, "find_repo_root", Mock(return_value=repo_root))
+    monkeypatch.setattr(cli, "Config", Mock(return_value=mock_cfg))
+    monkeypatch.setattr(cli, "KnowledgeGraphBuilder", Mock(return_value=mock_builder))
+
+    cli.cmd_status(argparse.Namespace(json=False, repo=None))
+
+    stdout = capsys.readouterr().out
+    assert "CodeMemory for m26pipeline" in stdout
+    assert "Graph Statistics for m26pipeline" in stdout
+    assert "codememory status --repo <path>" in stdout
 
 
 def test_index_json_success_envelope(monkeypatch, capsys, tmp_path):

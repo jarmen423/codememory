@@ -13,6 +13,7 @@ import fnmatch
 import math
 import posixpath
 import re
+import json
 from pathlib import Path
 from typing import Any, List, Dict, Optional, Tuple, Set
 from functools import wraps
@@ -122,6 +123,7 @@ class KnowledgeGraphBuilder:
     EMBEDDING_MODEL = "text-embedding-3-large"
     COST_PER_1M_TOKENS = 0.13  # USD
     VECTOR_DIMENSIONS = 3072
+    MEMORY_LABEL = "Memory"
 
     def __init__(
         self,
@@ -165,6 +167,7 @@ class KnowledgeGraphBuilder:
         self.openai_client = OpenAI(api_key=openai_key) if openai_key else None
         self.parsers = self._init_parsers()
         self.repo_root = repo_root
+        self.repo_id: Optional[str] = str(repo_root.resolve()) if repo_root else None
         self.token_usage = {
             "embedding_tokens": 0,
             "embedding_calls": 0,
@@ -267,21 +270,24 @@ class KnowledgeGraphBuilder:
     def _delete_file_subgraph(self, session: neo4j.Session, rel_path: str):
         """Delete one File node and all derived entities/chunks."""
         session.run(
-            """
-            MATCH (chunk:Chunk)-[:DESCRIBES]->(f:File {path: $path})
+            f"""
+            MATCH (chunk:Chunk)-[:DESCRIBES]->(f:File {self._file_key})
             DETACH DELETE chunk
             """,
-            path=rel_path,
+            **self._with_repo(path=rel_path),
         )
         session.run(
-            """
-            MATCH (f:File {path: $path})-[:DEFINES]->(entity)
+            f"""
+            MATCH (f:File {self._file_key})-[:DEFINES]->(entity)
             OPTIONAL MATCH (chunk:Chunk)-[:DESCRIBES]->(entity)
             DETACH DELETE chunk, entity
             """,
-            path=rel_path,
+            **self._with_repo(path=rel_path),
         )
-        session.run("MATCH (f:File {path: $path}) DETACH DELETE f", path=rel_path)
+        session.run(
+            f"MATCH (f:File {self._file_key}) DETACH DELETE f",
+            **self._with_repo(path=rel_path),
+        )
 
     def _create_document_chunk(
         self,
@@ -294,11 +300,11 @@ class KnowledgeGraphBuilder:
     ) -> None:
         """Create semantic chunks attached directly to a File node."""
         session.run(
-            """
-            MATCH (chunk:Chunk)-[:DESCRIBES]->(f:File {path: $path})
+            f"""
+            MATCH (chunk:Chunk)-[:DESCRIBES]->(f:File {self._file_key})
             DETACH DELETE chunk
             """,
-            path=rel_path,
+            **self._with_repo(path=rel_path),
         )
 
         if extension == ".md":
@@ -310,29 +316,26 @@ class KnowledgeGraphBuilder:
             return
 
         session.run(
-            """
-            MATCH (f:File {path: $path})
+            f"""
+            MATCH (f:File {self._file_key})
             SET f.name = $name
             """,
-            path=rel_path,
-            name=file_name,
+            **self._with_repo(path=rel_path, name=file_name),
         )
 
         for label, chunk_text in chunks:
             enriched_text = f"Context: File {rel_path} > {label}\n\n{chunk_text}"
             embedding = self.get_embedding(enriched_text)
             session.run(
-                """
-                MATCH (f:File {path: $path})
-                CREATE (ch:Chunk {id: randomUUID()})
+                f"""
+                MATCH (f:File {self._file_key})
+                CREATE (ch:Chunk {{id: randomUUID()}})
                 SET ch.text = $text,
                     ch.embedding = $embedding,
                     ch.created_at = datetime()
                 MERGE (ch)-[:DESCRIBES]->(f)
                 """,
-                path=rel_path,
-                text=chunk_text,
-                embedding=embedding,
+                **self._with_repo(path=rel_path, text=chunk_text, embedding=embedding),
             )
 
     def _split_markdown_document(
@@ -408,41 +411,155 @@ class KnowledgeGraphBuilder:
     # DATABASE SETUP
     # =========================================================================
 
+    def _backfill_repo_id(self, session) -> None:
+        """Stamp repo_id on all existing nodes that lack it before migrating constraints."""
+        if not self.repo_id:
+            return
+        for label in ("File", "Function", "Class", "Memory"):
+            session.run(
+                f"MATCH (n:{label}) WHERE n.repo_id IS NULL SET n.repo_id = $repo_id",
+                repo_id=self.repo_id,
+            )
+        logger.info(f"✅ Backfilled repo_id='{self.repo_id}' on existing nodes.")
+
+    def _with_repo(self, **kwargs) -> dict:
+        """Return kwargs with repo_id added when self.repo_id is set."""
+        if self.repo_id:
+            kwargs["repo_id"] = self.repo_id
+        return kwargs
+
+    @property
+    def _file_key(self) -> str:
+        """Cypher property map for File identity — scoped by repo_id when set."""
+        return "{repo_id: $repo_id, path: $path}" if self.repo_id else "{path: $path}"
+
+    @property
+    def _function_key(self) -> str:
+        return "{repo_id: $repo_id, signature: $sig}" if self.repo_id else "{signature: $sig}"
+
+    @property
+    def _class_key(self) -> str:
+        return "{repo_id: $repo_id, qualified_name: $sig}" if self.repo_id else "{qualified_name: $sig}"
+
+    @property
+    def _memory_key(self) -> str:
+        return "{repo_id: $repo_id, name: $name}" if self.repo_id else "{name: $name}"
+
     def setup_database(self):
         """
         Pass 0: Pre-flight Configuration.
         Creates constraints and vector indexes to optimize ingestion and retrieval.
+        When repo_id is set, migrates to composite (repo_id, property) constraints
+        for multi-repo support.
         """
         logger.info("🚀 [Pass 0] Configuring Database Constraints & Indexes...")
 
+        with self.driver.session() as session:
+            # --- Migration: run before any constraint changes ---
+            if self.repo_id:
+                self._backfill_repo_id(session)
+
+            base_queries = [
+                # Vector Index for Hybrid Search
+                f"""
+                CREATE VECTOR INDEX code_embeddings IF NOT EXISTS
+                FOR (c:Chunk) ON (c.embedding)
+                OPTIONS {{indexConfig: {{
+                 `vector.dimensions`: {self.VECTOR_DIMENSIONS},
+                 `vector.similarity_function`: 'cosine'
+                }} }}
+                """,
+                # Fulltext Index for Keyword Search
+                """
+                CREATE FULLTEXT INDEX entity_text_search IF NOT EXISTS
+                FOR (n:Function|Class|File) ON EACH [n.name, n.docstring, n.path]
+                """,
+            ]
+
+            if self.repo_id:
+                # Composite constraints for multi-repo isolation
+                constraint_queries = [
+                    # Drop old global constraints (safe: IF EXISTS)
+                    "DROP CONSTRAINT file_path_unique IF EXISTS",
+                    "DROP CONSTRAINT function_sig_unique IF EXISTS",
+                    "DROP CONSTRAINT class_name_unique IF EXISTS",
+                    # Create composite (repo_id, property) constraints
+                    "CREATE CONSTRAINT file_repo_path_unique IF NOT EXISTS "
+                    "FOR (f:File) REQUIRE (f.repo_id, f.path) IS UNIQUE",
+                    "CREATE CONSTRAINT function_repo_sig_unique IF NOT EXISTS "
+                    "FOR (fn:Function) REQUIRE (fn.repo_id, fn.signature) IS UNIQUE",
+                    "CREATE CONSTRAINT class_repo_qual_unique IF NOT EXISTS "
+                    "FOR (c:Class) REQUIRE (c.repo_id, c.qualified_name) IS UNIQUE",
+                    # Repository anchor node constraint
+                    "CREATE CONSTRAINT repo_id_unique IF NOT EXISTS "
+                    "FOR (r:Repository) REQUIRE r.repo_id IS UNIQUE",
+                ]
+            else:
+                # Legacy single-repo constraints (no repo_id)
+                constraint_queries = [
+                    "CREATE CONSTRAINT file_path_unique IF NOT EXISTS FOR (f:File) REQUIRE f.path IS UNIQUE",
+                    "CREATE CONSTRAINT function_sig_unique IF NOT EXISTS FOR (f:Function) REQUIRE f.signature IS UNIQUE",
+                    "CREATE CONSTRAINT class_name_unique IF NOT EXISTS FOR (c:Class) REQUIRE c.qualified_name IS UNIQUE",
+                ]
+
+            for q in constraint_queries + base_queries:
+                try:
+                    session.run(q)
+                except (neo4j.exceptions.DatabaseError, neo4j.exceptions.ClientError) as e:
+                    logger.warning(f"Constraint/Index check: {e}")
+
+            # Upsert Repository anchor node
+            if self.repo_id:
+                try:
+                    session.run(
+                        "MERGE (r:Repository {repo_id: $repo_id}) "
+                        "SET r.root_path = $root_path, r.updated_at = datetime()",
+                        repo_id=self.repo_id,
+                        root_path=str(self.repo_root) if self.repo_root else self.repo_id,
+                    )
+                except (neo4j.exceptions.DatabaseError, neo4j.exceptions.ClientError) as e:
+                    logger.warning(f"Repository anchor upsert: {e}")
+
+        logger.info("✅ Database configured.")
+
+    def setup_memory_schema(self):
+        """Create constraints and indexes for agent-authored memory entities."""
+        if self.repo_id:
+            name_constraint = (
+                "DROP CONSTRAINT memory_name_unique IF EXISTS",
+                "CREATE CONSTRAINT memory_repo_name_unique IF NOT EXISTS "
+                f"FOR (m:{self.MEMORY_LABEL}) REQUIRE (m.repo_id, m.name) IS UNIQUE",
+            )
+        else:
+            name_constraint = (
+                "CREATE CONSTRAINT memory_name_unique IF NOT EXISTS "
+                f"FOR (m:{self.MEMORY_LABEL}) REQUIRE m.name IS UNIQUE",
+            )
         queries = [
-            # 1. Uniqueness Constraints (Critical for Merge performance)
-            "CREATE CONSTRAINT file_path_unique IF NOT EXISTS FOR (f:File) REQUIRE f.path IS UNIQUE",
-            "CREATE CONSTRAINT function_sig_unique IF NOT EXISTS FOR (f:Function) REQUIRE f.signature IS UNIQUE",
-            "CREATE CONSTRAINT class_name_unique IF NOT EXISTS FOR (c:Class) REQUIRE c.qualified_name IS UNIQUE",
-            # 2. Vector Index for Hybrid Search
+            *name_constraint,
             f"""
-            CREATE VECTOR INDEX code_embeddings IF NOT EXISTS
-            FOR (c:Chunk) ON (c.embedding)
+            CREATE VECTOR INDEX memory_embeddings IF NOT EXISTS
+            FOR (m:{self.MEMORY_LABEL}) ON (m.embedding)
             OPTIONS {{indexConfig: {{
              `vector.dimensions`: {self.VECTOR_DIMENSIONS},
              `vector.similarity_function`: 'cosine'
             }} }}
             """,
-            # 3. Fulltext Index for Keyword Search
-            """
-            CREATE FULLTEXT INDEX entity_text_search IF NOT EXISTS
-            FOR (n:Function|Class|File) ON EACH [n.name, n.docstring, n.path]
-            """,
+            (
+                "CREATE FULLTEXT INDEX memory_search IF NOT EXISTS "
+                f"FOR (m:{self.MEMORY_LABEL}) ON EACH [m.name, m.entity_type, m.observation_text]"
+            ),
         ]
 
-        with self.driver.session() as session:
-            for q in queries:
-                try:
-                    session.run(q)
-                except (neo4j.exceptions.DatabaseError, neo4j.exceptions.ClientError) as e:
-                    logger.warning(f"Constraint/Index check: {e}")
-        logger.info("✅ Database configured.")
+        def _execute_setup() -> None:
+            with self.driver.session() as session:
+                for query in queries:
+                    try:
+                        session.run(query)
+                    except (neo4j.exceptions.DatabaseError, neo4j.exceptions.ClientError) as e:
+                        logger.warning(f"Memory schema check: {e}")
+
+        self.circuit_breaker.call(_execute_setup)
 
     # =========================================================================
     # EMBEDDING GENERATION
@@ -545,7 +662,8 @@ class KnowledgeGraphBuilder:
 
                     # Check if file exists and hash matches (Change Detection)
                     result = session.run(
-                        "MATCH (f:File {path: $path}) RETURN f.ohash as hash", path=rel_path
+                        f"MATCH (f:File {self._file_key}) RETURN f.ohash as hash",
+                        **self._with_repo(path=rel_path),
                     ).single()
 
                     if result and result["hash"] == current_ohash:
@@ -554,22 +672,26 @@ class KnowledgeGraphBuilder:
 
                     # Create/Update File Node
                     session.run(
-                        """
-                        MERGE (f:File {path: $path})
+                        f"""
+                        MERGE (f:File {self._file_key})
                         SET f.name = $name,
                             f.ohash = $ohash,
                             f.last_updated = datetime()
-                    """,
-                        path=rel_path,
-                        name=file_name,
-                        ohash=current_ohash,
+                        """,
+                        **self._with_repo(path=rel_path, name=file_name, ohash=current_ohash),
                     )
                     count += 1
 
             # Prune File nodes that are no longer indexable under current rules.
+            prune_query = (
+                "MATCH (f:File) WHERE f.repo_id = $repo_id RETURN f.path as path"
+                if self.repo_id
+                else "MATCH (f:File) RETURN f.path as path"
+            )
+            prune_params = {"repo_id": self.repo_id} if self.repo_id else {}
             existing_paths = [
                 record["path"]
-                for record in session.run("MATCH (f:File) RETURN f.path as path")
+                for record in session.run(prune_query, **prune_params)
             ]
             for rel_path in existing_paths:
                 if self._should_prune_file(rel_path, repo_path, supported_extensions):
@@ -601,7 +723,13 @@ class KnowledgeGraphBuilder:
 
         with self.driver.session() as session:
             # Fetch all files that need indexing
-            result = session.run("MATCH (f:File) RETURN f.path as path")
+            if self.repo_id:
+                result = session.run(
+                    "MATCH (f:File) WHERE f.repo_id = $repo_id RETURN f.path as path",
+                    repo_id=self.repo_id,
+                )
+            else:
+                result = session.run("MATCH (f:File) RETURN f.path as path")
             files_to_process = [record["path"] for record in result]
 
             for i, rel_path in enumerate(files_to_process):
@@ -675,27 +803,24 @@ class KnowledgeGraphBuilder:
                         if tag == "class":
                             # 1. Create Class Node
                             session.run(
-                                """
-                                MATCH (f:File {path: $path})
-                                MERGE (c:Class {qualified_name: $sig})
+                                f"""
+                                MATCH (f:File {self._file_key})
+                                MERGE (c:Class {self._class_key})
                                 SET c.name = $name, c.code = $code
                                 MERGE (f)-[:DEFINES]->(c)
-                            """,
-                                path=rel_path,
-                                sig=signature,
-                                name=name,
-                                code=node_text,
+                                """,
+                                **self._with_repo(path=rel_path, sig=signature, name=name, code=node_text),
                             )
 
                             # 2. Hybrid Chunking: Class Context
                             # Skip if chunk already exists (avoid re-embedding)
                             existing = session.run(
-                                """
-                                MATCH (c:Class {qualified_name: $sig})
+                                f"""
+                                MATCH (c:Class {self._class_key})
                                 OPTIONAL MATCH (ch:Chunk)-[:DESCRIBES]->(c)
                                 RETURN ch.id as chunk_id LIMIT 1
-                            """,
-                                sig=signature,
+                                """,
+                                **self._with_repo(sig=signature),
                             ).single()
 
                             if not existing or not existing["chunk_id"]:
@@ -704,17 +829,15 @@ class KnowledgeGraphBuilder:
                                 embedding = self.get_embedding(enriched_text)
 
                                 session.run(
-                                    """
-                                    MATCH (c:Class {qualified_name: $sig})
-                                    CREATE (ch:Chunk {id: randomUUID()})
+                                    f"""
+                                    MATCH (c:Class {self._class_key})
+                                    CREATE (ch:Chunk {{id: randomUUID()}})
                                     SET ch.text = $text,
                                         ch.embedding = $embedding,
                                         ch.created_at = datetime()
                                     MERGE (ch)-[:DESCRIBES]->(c)
-                                """,
-                                    sig=signature,
-                                    text=node_text,
-                                    embedding=embedding,
+                                    """,
+                                    **self._with_repo(sig=signature, text=node_text, embedding=embedding),
                                 )
 
                         elif tag == "function":
@@ -736,40 +859,45 @@ class KnowledgeGraphBuilder:
 
                             # 1. Create Function Node
                             session.run(
-                                """
-                                MATCH (f:File {path: $path})
-                                MERGE (fn:Function {signature: $sig})
+                                f"""
+                                MATCH (f:File {self._file_key})
+                                MERGE (fn:Function {self._function_key})
                                 SET fn.name = $name, fn.code = $code
                                 MERGE (f)-[:DEFINES]->(fn)
-                            """,
-                                path=rel_path,
-                                sig=full_sig,
-                                name=name,
-                                code=node_text,
+                                """,
+                                **self._with_repo(path=rel_path, sig=full_sig, name=name, code=node_text),
                             )
 
                             # Link to parent class if exists
                             if parent_class:
                                 class_sig = f"{rel_path}:{parent_class}"
-                                session.run(
+                                has_method_query = (
                                     """
+                                    MATCH (c:Class {qualified_name: $csig, repo_id: $repo_id})
+                                    MATCH (fn:Function {signature: $fsig, repo_id: $repo_id})
+                                    MERGE (c)-[:HAS_METHOD]->(fn)
+                                    """
+                                    if self.repo_id
+                                    else """
                                     MATCH (c:Class {qualified_name: $csig})
                                     MATCH (fn:Function {signature: $fsig})
                                     MERGE (c)-[:HAS_METHOD]->(fn)
-                                """,
-                                    csig=class_sig,
-                                    fsig=full_sig,
+                                    """
+                                )
+                                session.run(
+                                    has_method_query,
+                                    **self._with_repo(csig=class_sig, fsig=full_sig),
                                 )
 
                             # 2. Hybrid Chunking: Function Context
                             # Skip if chunk already exists (avoid re-embedding)
                             existing = session.run(
-                                """
-                                MATCH (fn:Function {signature: $sig})
+                                f"""
+                                MATCH (fn:Function {self._function_key})
                                 OPTIONAL MATCH (ch:Chunk)-[:DESCRIBES]->(fn)
                                 RETURN ch.id as chunk_id LIMIT 1
-                            """,
-                                sig=full_sig,
+                                """,
+                                **self._with_repo(sig=full_sig),
                             ).single()
 
                             if not existing or not existing["chunk_id"]:
@@ -784,17 +912,15 @@ class KnowledgeGraphBuilder:
                                 embedding = self.get_embedding(enriched_text)
 
                                 session.run(
-                                    """
-                                    MATCH (fn:Function {signature: $sig})
-                                    CREATE (ch:Chunk {id: randomUUID()})
+                                    f"""
+                                    MATCH (fn:Function {self._function_key})
+                                    CREATE (ch:Chunk {{id: randomUUID()}})
                                     SET ch.text = $text,
                                         ch.embedding = $embedding,
                                         ch.created_at = datetime()
                                     MERGE (ch)-[:DESCRIBES]->(fn)
-                                """,
-                                    sig=full_sig,
-                                    text=node_text,
-                                    embedding=embedding,
+                                    """,
+                                    **self._with_repo(sig=full_sig, text=node_text, embedding=embedding),
                                 )
 
         logger.info("✅ [Pass 2] Entities and Semantic Chunks created.")
@@ -938,7 +1064,13 @@ class KnowledgeGraphBuilder:
         supported_exts = {".py", ".js", ".jsx", ".ts", ".tsx"}
 
         with self.driver.session() as session:
-            result = session.run("MATCH (f:File) RETURN f.path as path")
+            if self.repo_id:
+                result = session.run(
+                    "MATCH (f:File) WHERE f.repo_id = $repo_id RETURN f.path as path",
+                    repo_id=self.repo_id,
+                )
+            else:
+                result = session.run("MATCH (f:File) RETURN f.path as path")
             all_paths = [r["path"] for r in result]
             path_set = set(all_paths)
             files = [path for path in all_paths if Path(path).suffix in supported_exts]
@@ -951,7 +1083,10 @@ class KnowledgeGraphBuilder:
                     logger.warning(
                         f"⚠️ File found in graph but missing on disk (Stale): {rel_path}. Deleting node."
                     )
-                    session.run("MATCH (f:File {path: $path}) DETACH DELETE f", path=rel_path)
+                    session.run(
+                        f"MATCH (f:File {self._file_key}) DETACH DELETE f",
+                        **self._with_repo(path=rel_path),
+                    )
                     continue
 
                 code = full_path.read_text(errors="ignore")
@@ -961,13 +1096,23 @@ class KnowledgeGraphBuilder:
                     modules = self._extract_js_ts_import_modules(code)
 
                 # Rebuild imports for this source file to avoid stale edges.
-                session.run(
-                    """
-                    MATCH (source:File {path: $src})-[r:IMPORTS]->()
-                    DELETE r
-                    """,
-                    src=rel_path,
-                )
+                if self.repo_id:
+                    session.run(
+                        """
+                        MATCH (source:File {repo_id: $repo_id, path: $src})-[r:IMPORTS]->()
+                        DELETE r
+                        """,
+                        src=rel_path,
+                        repo_id=self.repo_id,
+                    )
+                else:
+                    session.run(
+                        """
+                        MATCH (source:File {path: $src})-[r:IMPORTS]->()
+                        DELETE r
+                        """,
+                        src=rel_path,
+                    )
 
                 exact_targets: Set[str] = set()
                 fuzzy_parts: Set[str] = set()
@@ -983,28 +1128,54 @@ class KnowledgeGraphBuilder:
                         fuzzy_parts.add(fuzzy_part)
 
                 if exact_targets:
-                    session.run(
-                        """
-                        MATCH (source:File {path: $src})
-                        UNWIND $targets as target_path
-                        MATCH (target:File {path: target_path})
-                        MERGE (source)-[:IMPORTS]->(target)
-                        """,
-                        src=rel_path,
-                        targets=sorted(exact_targets),
-                    )
+                    if self.repo_id:
+                        session.run(
+                            """
+                            MATCH (source:File {repo_id: $repo_id, path: $src})
+                            UNWIND $targets as target_path
+                            MATCH (target:File {repo_id: $repo_id, path: target_path})
+                            MERGE (source)-[:IMPORTS]->(target)
+                            """,
+                            src=rel_path,
+                            targets=sorted(exact_targets),
+                            repo_id=self.repo_id,
+                        )
+                    else:
+                        session.run(
+                            """
+                            MATCH (source:File {path: $src})
+                            UNWIND $targets as target_path
+                            MATCH (target:File {path: target_path})
+                            MERGE (source)-[:IMPORTS]->(target)
+                            """,
+                            src=rel_path,
+                            targets=sorted(exact_targets),
+                        )
 
                 for mod_part in sorted(fuzzy_parts):
-                    session.run(
-                        """
-                        MATCH (source:File {path: $src})
-                        MATCH (target:File)
-                        WHERE target.path CONTAINS $mod_part
-                        MERGE (source)-[:IMPORTS]->(target)
-                        """,
-                        src=rel_path,
-                        mod_part=mod_part,
-                    )
+                    if self.repo_id:
+                        session.run(
+                            """
+                            MATCH (source:File {repo_id: $repo_id, path: $src})
+                            MATCH (target:File {repo_id: $repo_id})
+                            WHERE target.path CONTAINS $mod_part
+                            MERGE (source)-[:IMPORTS]->(target)
+                            """,
+                            src=rel_path,
+                            mod_part=mod_part,
+                            repo_id=self.repo_id,
+                        )
+                    else:
+                        session.run(
+                            """
+                            MATCH (source:File {path: $src})
+                            MATCH (target:File)
+                            WHERE target.path CONTAINS $mod_part
+                            MERGE (source)-[:IMPORTS]->(target)
+                            """,
+                            src=rel_path,
+                            mod_part=mod_part,
+                        )
 
             logger.info("✅ [Pass 3] Import graph built.")
 
@@ -1030,12 +1201,22 @@ class KnowledgeGraphBuilder:
 
         with self.driver.session() as session:
             # Get all function definitions ordered by file
-            result = session.run(
-                """
-                MATCH (f:File)-[:DEFINES]->(fn:Function)
-                RETURN f.path as path, collect({name: fn.name, sig: fn.signature}) as funcs
-            """
-            )
+            if self.repo_id:
+                result = session.run(
+                    """
+                    MATCH (f:File)-[:DEFINES]->(fn:Function)
+                    WHERE f.repo_id = $repo_id
+                    RETURN f.path as path, collect({name: fn.name, sig: fn.signature}) as funcs
+                    """,
+                    repo_id=self.repo_id,
+                )
+            else:
+                result = session.run(
+                    """
+                    MATCH (f:File)-[:DEFINES]->(fn:Function)
+                    RETURN f.path as path, collect({name: fn.name, sig: fn.signature}) as funcs
+                    """
+                )
             file_records = list(result)
             total_files = len(file_records)
 
@@ -1074,17 +1255,31 @@ class KnowledgeGraphBuilder:
                         caller_sig = func["sig"]
 
                         # Create relationships for found calls
-                        session.run(
-                            """
-                            UNWIND $calls as called_name
-                            MATCH (caller:Function {signature: $caller_sig})
-                            MATCH (callee:Function {name: called_name})
-                            WHERE caller <> callee
-                            MERGE (caller)-[:CALLS]->(callee)
-                        """,
-                            caller_sig=caller_sig,
-                            calls=calls_in_file,
-                        )
+                        if self.repo_id:
+                            session.run(
+                                """
+                                UNWIND $calls as called_name
+                                MATCH (caller:Function {signature: $caller_sig, repo_id: $repo_id})
+                                MATCH (callee:Function {name: called_name, repo_id: $repo_id})
+                                WHERE caller <> callee
+                                MERGE (caller)-[:CALLS]->(callee)
+                                """,
+                                caller_sig=caller_sig,
+                                calls=calls_in_file,
+                                repo_id=self.repo_id,
+                            )
+                        else:
+                            session.run(
+                                """
+                                UNWIND $calls as called_name
+                                MATCH (caller:Function {signature: $caller_sig})
+                                MATCH (callee:Function {name: called_name})
+                                WHERE caller <> callee
+                                MERGE (caller)-[:CALLS]->(callee)
+                                """,
+                                caller_sig=caller_sig,
+                                calls=calls_in_file,
+                            )
 
                 except (neo4j.exceptions.DatabaseError, neo4j.exceptions.ClientError) as e:
                     logger.warning(f"⚠️ Failed to process calls in {rel_path}: {e}")
@@ -1151,17 +1346,27 @@ class KnowledgeGraphBuilder:
     # SEMANTIC SEARCH (for MCP Server)
     # =========================================================================
 
-    def semantic_search(self, query: str, limit: int = 5) -> List[Dict]:
+    def semantic_search(self, query: str, limit: int = 5, repo_id: Optional[str] = None) -> List[Dict]:
         """
-        Hybrid Search for the Agent using vector similarity.
+        Graph-enriched hybrid search for the Agent.
+
+        Vector search finds semantically relevant Chunk nodes; graph traversal
+        then expands each hit to return structural context (file path, call
+        relationships, sibling functions, file imports) in the same query.
+        When repo_id is active, over-fetches by 3x then filters and reranks.
 
         Args:
             query: Natural language query
             limit: Maximum number of results to return
+            repo_id: Override repo scope (defaults to self.repo_id)
 
         Returns:
-            List of dicts with name, signature, score, and text
+            List of dicts with: name, sig, score, final_score, text, file_path,
+            calls_out, called_by, methods, file_imports, siblings
         """
+        active_repo = repo_id or self.repo_id
+        overfetch = limit * 3 if active_repo else limit
+
         def _is_valid_vector(vec: List[float]) -> bool:
             if not vec:
                 return False
@@ -1173,20 +1378,43 @@ class KnowledgeGraphBuilder:
             return math.isfinite(norm_sq) and norm_sq > 0.0
 
         def _fallback_fulltext_search() -> List[Dict]:
-            cypher = """
+            repo_filter = "AND node.repo_id = $repo_id" if active_repo else ""
+            cypher = f"""
             CALL db.index.fulltext.queryNodes('entity_text_search', $query)
             YIELD node, score
+            WHERE 1=1 {repo_filter}
             OPTIONAL MATCH (ch:Chunk)-[:DESCRIBES]->(node)
+            OPTIONAL MATCH (node)<-[:DEFINES]-(file:File)
+            OPTIONAL MATCH (node)-[:CALLS]->(callee:Function)
+            OPTIONAL MATCH (caller:Function)-[:CALLS]->(node)
+            OPTIONAL MATCH (node)-[:HAS_METHOD]->(method:Function)
+            OPTIONAL MATCH (file)-[:IMPORTS]->(imported_file:File)
+            OPTIONAL MATCH (file)-[:DEFINES]->(sibling) WHERE sibling <> node
+            WITH node, score, ch, file,
+                 collect(DISTINCT callee.name)[..5] as calls_out,
+                 collect(DISTINCT caller.name)[..5] as called_by,
+                 collect(DISTINCT method.name)[..5] as methods,
+                 collect(DISTINCT imported_file.path)[..3] as file_imports,
+                 collect(DISTINCT sibling.name)[..8] as siblings
             RETURN
                 coalesce(node.name, node.path, 'Unknown') as name,
                 coalesce(node.signature, node.qualified_name, '') as sig,
                 score,
-                coalesce(ch.text, node.docstring, node.path, '') as text
+                coalesce(ch.text, node.docstring, node.path, '') as text,
+                file.path as file_path,
+                calls_out,
+                called_by,
+                methods,
+                file_imports,
+                siblings
             ORDER BY score DESC
             LIMIT $limit
             """
+            params: Dict = {"query": query, "limit": overfetch}
+            if active_repo:
+                params["repo_id"] = active_repo
             with self.driver.session() as session:
-                res = session.run(cypher, query=query, limit=limit)
+                res = session.run(cypher, **params)
                 return [dict(r) for r in res]
 
         def _execute_search():
@@ -1196,20 +1424,68 @@ class KnowledgeGraphBuilder:
                     "Semantic query vector invalid (likely missing OpenAI key or zero-vector); "
                     "falling back to full-text search."
                 )
-                return _fallback_fulltext_search()
+                results = _fallback_fulltext_search()
+                return self._rerank_results(results, limit)
 
-            cypher = """
-            CALL db.index.vector.queryNodes('code_embeddings', $limit, $vec)
-            YIELD node, score
-            MATCH (node)-[:DESCRIBES]->(target)
-            RETURN target.name as name, target.signature as sig, score, node.text as text
+            repo_filter = "WHERE entity.repo_id = $repo_id" if active_repo else ""
+            cypher = f"""
+            CALL db.index.vector.queryNodes('code_embeddings', $overfetch, $vec)
+            YIELD node as chunk, score
+            MATCH (chunk)-[:DESCRIBES]->(entity)
+            {repo_filter}
+            OPTIONAL MATCH (entity)<-[:DEFINES]-(file:File)
+            OPTIONAL MATCH (entity)-[:CALLS]->(callee:Function)
+            OPTIONAL MATCH (caller:Function)-[:CALLS]->(entity)
+            OPTIONAL MATCH (entity)-[:HAS_METHOD]->(method:Function)
+            OPTIONAL MATCH (file)-[:IMPORTS]->(imported_file:File)
+            OPTIONAL MATCH (file)-[:DEFINES]->(sibling) WHERE sibling <> entity
+            WITH entity, chunk, score, file,
+                 collect(DISTINCT callee.name)[..5] as calls_out,
+                 collect(DISTINCT caller.name)[..5] as called_by,
+                 collect(DISTINCT method.name)[..5] as methods,
+                 collect(DISTINCT imported_file.path)[..3] as file_imports,
+                 collect(DISTINCT sibling.name)[..8] as siblings
+            RETURN
+                coalesce(entity.name, entity.path, 'Unknown') as name,
+                coalesce(entity.signature, entity.qualified_name, '') as sig,
+                score,
+                chunk.text as text,
+                file.path as file_path,
+                calls_out,
+                called_by,
+                methods,
+                file_imports,
+                siblings
             ORDER BY score DESC
             """
+            params: Dict = {"overfetch": overfetch, "vec": vector}
+            if active_repo:
+                params["repo_id"] = active_repo
             with self.driver.session() as session:
-                res = session.run(cypher, limit=limit, vec=vector)
-                return [dict(r) for r in res]
-        
+                res = session.run(cypher, **params)
+                results = [dict(r) for r in res]
+            return self._rerank_results(results, limit)
+
         return self.circuit_breaker.call(_execute_search)
+
+    def _rerank_results(self, results: List[Dict], limit: int) -> List[Dict]:
+        """
+        Structural reranking after repo-filtered retrieval.
+        Combines vector score (90%) with graph connectivity bonus (10%).
+        # GDS/PageRank upgrade path: when gds.aura.api.credentials are configured,
+        # replace the structural bonus with entity.pagerank from gds.pageRank.write().
+        """
+        for r in results:
+            structural = 0.0
+            if r.get("calls_out"):
+                structural += 0.05  # has outgoing calls
+            if r.get("called_by"):
+                structural += 0.05  # is called by others — more central
+            if r.get("methods"):
+                structural += 0.03  # is a class with methods
+            r["final_score"] = r.get("score", 0.0) * 0.9 + structural
+        results.sort(key=lambda x: x["final_score"], reverse=True)
+        return results[:limit]
 
     # =========================================================================
     # DEPENDENCY ANALYSIS (for MCP Server)
@@ -1225,8 +1501,9 @@ class KnowledgeGraphBuilder:
         Returns:
             Dict with 'imports' and 'imported_by' lists
         """
-        cypher = """
-        MATCH (f:File {path: $path})
+        repo_clause = ", repo_id: $repo_id" if self.repo_id else ""
+        cypher = f"""
+        MATCH (f:File {{path: $path{repo_clause}}})
         OPTIONAL MATCH (f)-[:IMPORTS]->(imported)
         OPTIONAL MATCH (dependent)-[:IMPORTS]->(f)
         RETURN
@@ -1234,7 +1511,7 @@ class KnowledgeGraphBuilder:
             collect(DISTINCT dependent.path) as imported_by
         """
         with self.driver.session() as session:
-            result = session.run(cypher, path=file_path).single()
+            result = session.run(cypher, **self._with_repo(path=file_path)).single()
             if result:
                 return {
                     "imports": result["imports"] or [],
@@ -1258,8 +1535,9 @@ class KnowledgeGraphBuilder:
         """
         def _execute_impact_analysis():
             depth = max(1, int(max_depth))
+            repo_clause = ", repo_id: $repo_id" if self.repo_id else ""
             cypher = f"""
-            MATCH path = (f:File {{path: $path}})<-[:IMPORTS*1..{depth}]-(dependent)
+            MATCH path = (f:File {{path: $path{repo_clause}}})<-[:IMPORTS*1..{depth}]-(dependent)
             RETURN DISTINCT
                 dependent.path as path,
                 length(path) as depth,
@@ -1267,7 +1545,7 @@ class KnowledgeGraphBuilder:
             ORDER BY depth, path
             """
             with self.driver.session() as session:
-                result = session.run(cypher, path=file_path)
+                result = session.run(cypher, **self._with_repo(path=file_path))
                 affected_files = [
                     {"path": r["path"], "depth": r["depth"], "impact_type": r["impact_type"]}
                     for r in result
@@ -1275,6 +1553,692 @@ class KnowledgeGraphBuilder:
                 return {"affected_files": affected_files, "total_count": len(affected_files)}
         
         return self.circuit_breaker.call(_execute_impact_analysis)
+
+    # =========================================================================
+    # MEMORY GRAPH QUERIES (for MCP Server)
+    # =========================================================================
+
+    @staticmethod
+    def _serialize_memory_observations(observations: List[str]) -> str:
+        """Join observations for search-friendly storage."""
+        return "\n".join(
+            obs.strip() for obs in observations if isinstance(obs, str) and obs.strip()
+        )
+
+    @staticmethod
+    def _normalize_memory_label(value: str) -> str:
+        """Normalize a user-provided memory type into a safe Neo4j label."""
+        cleaned = re.sub(r"[^0-9A-Za-z_]", "_", str(value or "").strip())
+        cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+        if not cleaned:
+            return "concept"
+        if cleaned[0].isdigit():
+            cleaned = f"Type_{cleaned}"
+        return cleaned
+
+    @staticmethod
+    def _normalize_memory_relation_type(value: str) -> str:
+        """Normalize a relation type into a safe Neo4j relationship type."""
+        cleaned = re.sub(r"[^0-9A-Za-z_]", "_", str(value or "").strip().upper())
+        cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+        if not cleaned:
+            raise ValueError("Relation type cannot be empty.")
+        if cleaned[0].isdigit():
+            cleaned = f"REL_{cleaned}"
+        return cleaned
+
+    @staticmethod
+    def _build_memory_embedding_text(
+        name: str, entity_type: str, observations: List[str]
+    ) -> str:
+        """Build the canonical text used for memory embeddings."""
+        lines = [f"Name: {name}", f"Type: {entity_type}"]
+        if observations:
+            lines.append("Observations:")
+            lines.extend(f"- {observation}" for observation in observations)
+        return "\n".join(lines)
+
+    def _get_memory_embedding_or_none(self, text: str) -> Optional[List[float]]:
+        """Return a memory embedding when OpenAI is configured, otherwise None."""
+        if self.openai_client is None:
+            return None
+        return self.get_embedding(text)
+
+    @staticmethod
+    def _normalize_memory_entity(entity: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate and normalize one memory entity payload."""
+        if not isinstance(entity, dict):
+            raise ValueError("Each entity must be an object.")
+
+        name = str(entity.get("name", "")).strip()
+        if not name:
+            raise ValueError("Each entity requires a non-empty 'name'.")
+
+        entity_type = str(
+            entity.get("entityType") or entity.get("entity_type") or "concept"
+        ).strip()
+        observations = entity.get("observations") or []
+        if not isinstance(observations, list):
+            raise ValueError(f"Entity '{name}' observations must be a list of strings.")
+
+        normalized_observations = []
+        for observation in observations:
+            text = str(observation).strip()
+            if text:
+                normalized_observations.append(text)
+
+        metadata = entity.get("metadata") or {}
+        if metadata and not isinstance(metadata, dict):
+            raise ValueError(f"Entity '{name}' metadata must be an object.")
+
+        return {
+            "name": name,
+            "entity_type": entity_type or "concept",
+            "entity_label": KnowledgeGraphBuilder._normalize_memory_label(entity_type or "concept"),
+            "observations": normalized_observations,
+            "observation_text": KnowledgeGraphBuilder._serialize_memory_observations(
+                normalized_observations
+            ),
+            "embedding_text": KnowledgeGraphBuilder._build_memory_embedding_text(
+                name, entity_type or "concept", normalized_observations
+            ),
+            "metadata_json": json.dumps(metadata, sort_keys=True) if metadata else "{}",
+        }
+
+    @staticmethod
+    def _normalize_memory_relation(relation: Dict[str, Any]) -> Dict[str, str]:
+        """Validate and normalize one memory relation payload."""
+        if not isinstance(relation, dict):
+            raise ValueError("Each relation must be an object.")
+
+        source = str(
+            relation.get("from")
+            or relation.get("from_entity")
+            or relation.get("source")
+            or ""
+        ).strip()
+        target = str(
+            relation.get("to")
+            or relation.get("to_entity")
+            or relation.get("target")
+            or ""
+        ).strip()
+        relation_type = str(
+            relation.get("relationType")
+            or relation.get("relation_type")
+            or relation.get("type")
+            or ""
+        ).strip()
+
+        if not source or not target or not relation_type:
+            raise ValueError("Each relation requires 'from', 'to', and 'relationType'.")
+
+        return {
+            "from": source,
+            "to": target,
+            "relation_type": KnowledgeGraphBuilder._normalize_memory_relation_type(relation_type),
+        }
+
+    @staticmethod
+    def _normalize_memory_observation_update(item: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate and normalize one observation update payload."""
+        if not isinstance(item, dict):
+            raise ValueError("Each observation update must be an object.")
+
+        entity_name = str(
+            item.get("entityName") or item.get("entity_name") or item.get("name") or ""
+        ).strip()
+        if not entity_name:
+            raise ValueError("Each observation update requires 'entityName'.")
+
+        contents = item.get("contents") or item.get("observations") or item.get("content") or []
+        if isinstance(contents, str):
+            contents = [contents]
+        if not isinstance(contents, list):
+            raise ValueError(
+                f"Observation update for '{entity_name}' must provide a list of strings."
+            )
+
+        normalized_contents = [str(content).strip() for content in contents if str(content).strip()]
+        if not normalized_contents:
+            raise ValueError(
+                f"Observation update for '{entity_name}' must include at least one string."
+            )
+
+        return {
+            "entity_name": entity_name,
+            "contents": normalized_contents,
+        }
+
+    def create_memory_entities(self, entities: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Create or update memory entities."""
+        normalized_entities = [self._normalize_memory_entity(entity) for entity in entities]
+        if not normalized_entities:
+            raise ValueError("At least one entity is required.")
+
+        self.setup_memory_schema()
+
+        def _execute_create() -> Dict[str, Any]:
+            entity_names: List[str] = []
+            with self.driver.session() as session:
+                for entity in normalized_entities:
+                    embedding = self._get_memory_embedding_or_none(entity["embedding_text"])
+                    params = {**entity, **({"repo_id": self.repo_id} if self.repo_id else {})}
+                    session.run(
+                        f"""
+                        MERGE (m:{self.MEMORY_LABEL} {self._memory_key})
+                        ON CREATE SET
+                            m.type = $entity_type,
+                            m.entity_type = $entity_type,
+                            m.observations = $observations,
+                            m.observation_text = $observation_text,
+                            m.metadata_json = $metadata_json,
+                            m.created_at = datetime(),
+                            m.updated_at = datetime()
+                        ON MATCH SET
+                            m.type = $entity_type,
+                            m.entity_type = $entity_type,
+                            m.observations = CASE
+                                WHEN size($observations) = 0 THEN coalesce(m.observations, [])
+                                ELSE $observations
+                            END,
+                            m.observation_text = CASE
+                                WHEN size($observations) = 0 THEN coalesce(m.observation_text, '')
+                                ELSE $observation_text
+                            END,
+                            m.metadata_json = $metadata_json,
+                            m.updated_at = datetime()
+                        """,
+                        **params,
+                    )
+                    if embedding is not None:
+                        session.run(
+                            f"""
+                            MATCH (m:{self.MEMORY_LABEL} {self._memory_key})
+                            SET m.embedding = $embedding
+                            """,
+                            **self._with_repo(name=entity["name"], embedding=embedding),
+                        )
+                    session.run(
+                        f"""
+                        MATCH (m:{self.MEMORY_LABEL} {self._memory_key})
+                        SET m:`{entity['entity_label']}`
+                        """,
+                        **self._with_repo(name=entity["name"]),
+                    )
+                    entity_names.append(entity["name"])
+
+            return {"count": len(entity_names), "entity_names": entity_names}
+
+        return self.circuit_breaker.call(_execute_create)
+
+    def delete_memory_entities(self, names: List[str]) -> Dict[str, Any]:
+        """Delete memory entities by name."""
+        normalized_names = [str(name).strip() for name in names if str(name).strip()]
+        if not normalized_names:
+            raise ValueError("At least one entity name is required.")
+
+        def _execute_delete() -> Dict[str, Any]:
+            with self.driver.session() as session:
+                repo_clause = "AND m.repo_id = $repo_id" if self.repo_id else ""
+                result = session.run(
+                    f"""
+                    MATCH (m:{self.MEMORY_LABEL})
+                    WHERE m.name IN $names {repo_clause}
+                    WITH collect(m.name) as matched_names, collect(m) as matched_nodes
+                    FOREACH (node IN matched_nodes | DETACH DELETE node)
+                    RETURN matched_names as matched_names
+                    """,
+                    **self._with_repo(names=normalized_names),
+                ).single()
+
+            deleted_names = result["matched_names"] if result and result["matched_names"] else []
+            missing_names = [name for name in normalized_names if name not in deleted_names]
+            return {
+                "count": len(deleted_names),
+                "deleted_names": deleted_names,
+                "missing_names": missing_names,
+            }
+
+        return self.circuit_breaker.call(_execute_delete)
+
+    def create_memory_relations(self, relations: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Create typed relations between memory entities."""
+        normalized_relations = [self._normalize_memory_relation(relation) for relation in relations]
+        if not normalized_relations:
+            raise ValueError("At least one relation is required.")
+
+        self.setup_memory_schema()
+
+        def _execute_create_relations() -> Dict[str, Any]:
+            created = []
+            missing = []
+            with self.driver.session() as session:
+                for relation in normalized_relations:
+                    repo_clause = ", repo_id: $repo_id" if self.repo_id else ""
+                    result = session.run(
+                        f"""
+                        MATCH (source:{self.MEMORY_LABEL} {{name: $source{repo_clause}}})
+                        MATCH (target:{self.MEMORY_LABEL} {{name: $target{repo_clause}}})
+                        MERGE (source)-[r:`{relation['relation_type']}`]->(target)
+                        ON CREATE SET r.created_at = datetime()
+                        ON MATCH SET r.updated_at = datetime()
+                        RETURN source.name as source, target.name as target, type(r) as relation_type
+                        """,
+                        **self._with_repo(source=relation["from"], target=relation["to"]),
+                    ).single()
+
+                    if result:
+                        created.append(dict(result))
+                    else:
+                        missing.append(relation)
+
+            return {"count": len(created), "relations": created, "missing": missing}
+
+        return self.circuit_breaker.call(_execute_create_relations)
+
+    def delete_memory_relations(self, relations: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Delete typed relations between memory entities."""
+        normalized_relations = [self._normalize_memory_relation(relation) for relation in relations]
+        if not normalized_relations:
+            raise ValueError("At least one relation is required.")
+
+        def _execute_delete_relations() -> Dict[str, Any]:
+            deleted = []
+            missing = []
+            with self.driver.session() as session:
+                for relation in normalized_relations:
+                    repo_clause = ", repo_id: $repo_id" if self.repo_id else ""
+                    result = session.run(
+                        f"""
+                        MATCH (source:{self.MEMORY_LABEL} {{name: $source{repo_clause}}})
+                        MATCH (target:{self.MEMORY_LABEL} {{name: $target{repo_clause}}})
+                        OPTIONAL MATCH (source)-[r:`{relation['relation_type']}`]->(target)
+                        WITH source, target, r
+                        FOREACH (_ IN CASE WHEN r IS NULL THEN [] ELSE [1] END | DELETE r)
+                        RETURN source.name as source, target.name as target, '{relation['relation_type']}' as relation_type, r IS NOT NULL as deleted
+                        """,
+                        **self._with_repo(source=relation["from"], target=relation["to"]),
+                    ).single()
+
+                    if result and result["deleted"]:
+                        deleted.append(
+                            {
+                                "from": result["source"],
+                                "to": result["target"],
+                                "relation_type": result["relation_type"],
+                            }
+                        )
+                    else:
+                        missing.append(relation)
+
+            return {"count": len(deleted), "relations": deleted, "missing": missing}
+
+        return self.circuit_breaker.call(_execute_delete_relations)
+
+    def add_memory_observations(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Append observations to memory entities."""
+        normalized_items = [self._normalize_memory_observation_update(item) for item in items]
+        if not normalized_items:
+            raise ValueError("At least one observation update is required.")
+
+        self.setup_memory_schema()
+
+        def _execute_add_observations() -> Dict[str, Any]:
+            updated = []
+            missing = []
+            with self.driver.session() as session:
+                for item in normalized_items:
+                    repo_clause = ", repo_id: $repo_id" if self.repo_id else ""
+                    result = session.run(
+                        f"""
+                        MATCH (m:{self.MEMORY_LABEL} {{name: $name{repo_clause}}})
+                        WITH m, [obs IN $contents WHERE NOT obs IN coalesce(m.observations, [])] as new_obs
+                        SET m.observations = coalesce(m.observations, []) + new_obs,
+                            m.observation_text = reduce(acc = '', obs IN (coalesce(m.observations, []) + new_obs) |
+                                CASE WHEN acc = '' THEN obs ELSE acc + '\n' + obs END),
+                            m.updated_at = datetime()
+                        RETURN m.name as name, coalesce(m.type, m.entity_type, 'concept') as entity_type, size(new_obs) as added_count, m.observations as observations
+                        """,
+                        **self._with_repo(name=item["entity_name"], contents=item["contents"]),
+                    ).single()
+
+                    if result:
+                        row = dict(result)
+                        embedding = self._get_memory_embedding_or_none(
+                            self._build_memory_embedding_text(
+                                row["name"], row["entity_type"], row["observations"] or []
+                            )
+                        )
+                        if embedding is not None:
+                            session.run(
+                                f"""
+                                MATCH (m:{self.MEMORY_LABEL} {{name: $name{repo_clause}}})
+                                SET m.embedding = $embedding
+                                """,
+                                **self._with_repo(name=row["name"], embedding=embedding),
+                            )
+                        updated.append(row)
+                    else:
+                        missing.append(item["entity_name"])
+
+            return {"count": len(updated), "entities": updated, "missing_names": missing}
+
+        return self.circuit_breaker.call(_execute_add_observations)
+
+    def delete_memory_observations(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Delete observations from memory entities."""
+        normalized_items = [self._normalize_memory_observation_update(item) for item in items]
+        if not normalized_items:
+            raise ValueError("At least one observation delete request is required.")
+
+        def _execute_delete_observations() -> Dict[str, Any]:
+            updated = []
+            missing = []
+            with self.driver.session() as session:
+                for item in normalized_items:
+                    repo_clause = ", repo_id: $repo_id" if self.repo_id else ""
+                    result = session.run(
+                        f"""
+                        MATCH (m:{self.MEMORY_LABEL} {{name: $name{repo_clause}}})
+                        WITH m, [obs IN coalesce(m.observations, []) WHERE NOT obs IN $contents] as kept
+                        SET m.observations = kept,
+                            m.observation_text = reduce(acc = '', obs IN kept |
+                                CASE WHEN acc = '' THEN obs ELSE acc + '\n' + obs END),
+                            m.updated_at = datetime()
+                        RETURN m.name as name, coalesce(m.type, m.entity_type, 'concept') as entity_type, size(kept) as remaining_count, m.observations as observations
+                        """,
+                        **self._with_repo(name=item["entity_name"], contents=item["contents"]),
+                    ).single()
+
+                    if result:
+                        row = dict(result)
+                        embedding = self._get_memory_embedding_or_none(
+                            self._build_memory_embedding_text(
+                                row["name"], row["entity_type"], row["observations"] or []
+                            )
+                        )
+                        if embedding is not None:
+                            session.run(
+                                f"""
+                                MATCH (m:{self.MEMORY_LABEL} {{name: $name{repo_clause}}})
+                                SET m.embedding = $embedding
+                                """,
+                                **self._with_repo(name=row["name"], embedding=embedding),
+                            )
+                        updated.append(row)
+                    else:
+                        missing.append(item["entity_name"])
+
+            return {"count": len(updated), "entities": updated, "missing_names": missing}
+
+        return self.circuit_breaker.call(_execute_delete_observations)
+
+    def backfill_memory_embeddings(self, limit: int = 100, only_missing: bool = True) -> Dict[str, Any]:
+        """Backfill embeddings for existing Memory nodes."""
+        self.setup_memory_schema()
+        safe_limit = max(1, int(limit))
+        if self.openai_client is None:
+            raise ValueError("OPENAI_API_KEY is required to backfill memory embeddings.")
+
+        def _execute_backfill() -> Dict[str, Any]:
+            with self.driver.session() as session:
+                filter_parts = []
+                if only_missing:
+                    filter_parts.append("m.embedding IS NULL")
+                if self.repo_id:
+                    filter_parts.append("m.repo_id = $repo_id")
+                filter_clause = f"WHERE {' AND '.join(filter_parts)}" if filter_parts else ""
+                rows = list(
+                    session.run(
+                        f"""
+                        MATCH (m:{self.MEMORY_LABEL})
+                        {filter_clause}
+                        RETURN m.name as name,
+                               coalesce(m.type, m.entity_type, 'concept') as entity_type,
+                               coalesce(m.observations, []) as observations
+                        ORDER BY m.name
+                        LIMIT $limit
+                        """,
+                        **self._with_repo(limit=safe_limit),
+                    )
+                )
+
+                updated_names = []
+                for row in rows:
+                    payload = dict(row)
+                    embedding = self.get_embedding(
+                        self._build_memory_embedding_text(
+                            payload["name"],
+                            payload["entity_type"],
+                            payload["observations"] or [],
+                        )
+                    )
+                    session.run(
+                        f"""
+                        MATCH (m:{self.MEMORY_LABEL} {{name: $name{', repo_id: $repo_id' if self.repo_id else ''}}})
+                        SET m.embedding = $embedding,
+                            m.updated_at = datetime()
+                        """,
+                        **self._with_repo(name=payload["name"], embedding=embedding),
+                    )
+                    updated_names.append(payload["name"])
+
+                remaining_where = ["m.embedding IS NULL"]
+                if self.repo_id:
+                    remaining_where.append("m.repo_id = $repo_id")
+                remaining_result = session.run(
+                    f"""
+                    MATCH (m:{self.MEMORY_LABEL})
+                    WHERE {' AND '.join(remaining_where)}
+                    RETURN count(m) as remaining
+                    """,
+                    **self._with_repo(),
+                ).single()
+
+            return {
+                "count": len(updated_names),
+                "entity_names": updated_names,
+                "remaining_without_embeddings": (
+                    remaining_result["remaining"] if remaining_result else 0
+                ),
+            }
+
+        return self.circuit_breaker.call(_execute_backfill)
+
+    def search_memory_nodes(
+        self, query: str, limit: int = 5, repo_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Search memory entities with vector search and fulltext fallback.
+        Returns outgoing and incoming relations. Filters by repo_id when active."""
+        normalized_query = str(query).strip()
+        safe_limit = max(1, int(limit))
+        if not normalized_query:
+            return []
+
+        active_repo = repo_id or self.repo_id
+        self.setup_memory_schema()
+
+        def _execute_search() -> List[Dict[str, Any]]:
+            repo_filter = "AND node.repo_id = $repo_id" if active_repo else ""
+
+            def _is_valid_vector(vec: List[float]) -> bool:
+                if not vec:
+                    return False
+                norm_sq = 0.0
+                for value in vec:
+                    if not isinstance(value, (int, float)) or not math.isfinite(value):
+                        return False
+                    norm_sq += float(value) * float(value)
+                return math.isfinite(norm_sq) and norm_sq > 0.0
+
+            if self.openai_client is None:
+                cypher = f"""
+                CALL db.index.fulltext.queryNodes('memory_search', $query_text)
+                YIELD node, score
+                WHERE 1=1 {repo_filter}
+                OPTIONAL MATCH (node:{self.MEMORY_LABEL})-[r_out]->(target:{self.MEMORY_LABEL})
+                OPTIONAL MATCH (source:{self.MEMORY_LABEL})-[r_in]->(node:{self.MEMORY_LABEL})
+                RETURN
+                    node.name as name,
+                    coalesce(node.type, node.entity_type, 'concept') as entity_type,
+                    coalesce(node.observations, []) as observations,
+                    coalesce(node.metadata_json, '{{}}') as metadata_json,
+                    score,
+                    ['fulltext'] as sources,
+                    collect(DISTINCT CASE
+                        WHEN target IS NULL THEN NULL
+                        ELSE {{target: target.name, relation_type: type(r_out)}}
+                    END) as outgoing_relations,
+                    collect(DISTINCT CASE
+                        WHEN source IS NULL THEN NULL
+                        ELSE {{source: source.name, relation_type: type(r_in)}}
+                    END) as incoming_relations
+                ORDER BY score DESC
+                LIMIT $limit
+                """
+                params: Dict = {"query_text": normalized_query, "limit": safe_limit}
+            else:
+                vector = self.get_embedding(normalized_query)
+                if not _is_valid_vector(vector):
+                    logger.warning(
+                        "Memory query vector invalid (likely missing OpenAI key or zero-vector); "
+                        "falling back to full-text search."
+                    )
+                    cypher = f"""
+                    CALL db.index.fulltext.queryNodes('memory_search', $query_text)
+                    YIELD node, score
+                    WHERE 1=1 {repo_filter}
+                    OPTIONAL MATCH (node:{self.MEMORY_LABEL})-[r_out]->(target:{self.MEMORY_LABEL})
+                    OPTIONAL MATCH (source:{self.MEMORY_LABEL})-[r_in]->(node:{self.MEMORY_LABEL})
+                    RETURN
+                        node.name as name,
+                        coalesce(node.type, node.entity_type, 'concept') as entity_type,
+                        coalesce(node.observations, []) as observations,
+                        coalesce(node.metadata_json, '{{}}') as metadata_json,
+                        score,
+                        ['fulltext'] as sources,
+                        collect(DISTINCT CASE
+                            WHEN target IS NULL THEN NULL
+                            ELSE {{target: target.name, relation_type: type(r_out)}}
+                        END) as outgoing_relations,
+                        collect(DISTINCT CASE
+                            WHEN source IS NULL THEN NULL
+                            ELSE {{source: source.name, relation_type: type(r_in)}}
+                        END) as incoming_relations
+                    ORDER BY score DESC
+                    LIMIT $limit
+                    """
+                    params = {"query_text": normalized_query, "limit": safe_limit}
+                else:
+                    cypher = f"""
+                    CALL {{
+                        CALL db.index.vector.queryNodes('memory_embeddings', $limit, $vector)
+                        YIELD node, score
+                        RETURN node, score, 'vector' as source
+                        UNION
+                        CALL db.index.fulltext.queryNodes('memory_search', $query_text)
+                        YIELD node, score
+                        RETURN node, score, 'fulltext' as source
+                    }}
+                    WITH node, max(score) as score, collect(DISTINCT source) as sources
+                    WHERE 1=1 {repo_filter}
+                    OPTIONAL MATCH (node:{self.MEMORY_LABEL})-[r_out]->(target:{self.MEMORY_LABEL})
+                    OPTIONAL MATCH (source:{self.MEMORY_LABEL})-[r_in]->(node:{self.MEMORY_LABEL})
+                    RETURN
+                        node.name as name,
+                        coalesce(node.type, node.entity_type, 'concept') as entity_type,
+                        coalesce(node.observations, []) as observations,
+                        coalesce(node.metadata_json, '{{}}') as metadata_json,
+                        score,
+                        sources,
+                        collect(DISTINCT CASE
+                            WHEN target IS NULL THEN NULL
+                            ELSE {{target: target.name, relation_type: type(r_out)}}
+                        END) as outgoing_relations,
+                        collect(DISTINCT CASE
+                            WHEN source IS NULL THEN NULL
+                            ELSE {{source: source.name, relation_type: type(r_in)}}
+                        END) as incoming_relations
+                    ORDER BY score DESC
+                    LIMIT $limit
+                    """
+                    params = {
+                        "query_text": normalized_query,
+                        "vector": vector,
+                        "limit": safe_limit,
+                    }
+            if active_repo:
+                params["repo_id"] = active_repo
+            with self.driver.session() as session:
+                result = session.run(cypher, **params)
+                rows = []
+                for record in result:
+                    row = dict(record)
+                    row["outgoing_relations"] = [
+                        rel for rel in row.get("outgoing_relations", []) if rel
+                    ]
+                    row["incoming_relations"] = [
+                        rel for rel in row.get("incoming_relations", []) if rel
+                    ]
+                    rows.append(row)
+                return rows
+
+        return self.circuit_breaker.call(_execute_search)
+
+    def read_memory_graph(self) -> Dict[str, Any]:
+        """Return a summarized view of the current memory graph."""
+        self.setup_memory_schema()
+
+        def _execute_read() -> Dict[str, Any]:
+            with self.driver.session() as session:
+                repo_filter = "WHERE m.repo_id = $repo_id" if self.repo_id else ""
+                nodes_result = session.run(
+                    f"""
+                    MATCH (m:{self.MEMORY_LABEL})
+                    {repo_filter}
+                    OPTIONAL MATCH (m)-[r]->(target:{self.MEMORY_LABEL})
+                    RETURN
+                        m.name as name,
+                        coalesce(m.type, m.entity_type, 'concept') as entity_type,
+                        coalesce(m.observations, []) as observations,
+                        collect(DISTINCT CASE
+                            WHEN target IS NULL THEN NULL
+                            ELSE {{
+                                target: target.name,
+                                relation_type: type(r)
+                            }}
+                        END) as outgoing_relations
+                    ORDER BY m.name
+                    """,
+                    **self._with_repo(),
+                )
+                entities = []
+                for record in nodes_result:
+                    row = dict(record)
+                    row["outgoing_relations"] = [
+                        rel for rel in row.get("outgoing_relations", []) if rel
+                    ]
+                    entities.append(row)
+
+                relation_where = "WHERE source.repo_id = $repo_id AND target.repo_id = $repo_id" if self.repo_id else ""
+                relation_count_result = session.run(
+                    f"""
+                    MATCH (source:{self.MEMORY_LABEL})-[r]->(target:{self.MEMORY_LABEL})
+                    {relation_where}
+                    RETURN count(r) as count
+                    """,
+                    **self._with_repo(),
+                ).single()
+                relation_count = relation_count_result["count"] if relation_count_result else 0
+
+            return {
+                "entity_count": len(entities),
+                "relation_count": relation_count,
+                "entities": entities,
+            }
+
+        return self.circuit_breaker.call(_execute_read)
 
     # =========================================================================
     # GIT GRAPH QUERIES (for MCP Server)

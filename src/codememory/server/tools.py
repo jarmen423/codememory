@@ -15,18 +15,37 @@ class Toolkit:
 
     def semantic_search(self, query: str, limit: int = 5) -> str:
         """
-        Performs hybrid search and formats the result as a readable string for the Agent.
+        Graph-enriched hybrid search formatted for the Agent.
+
+        Each result includes the vector-matched code plus graph context:
+        file location, call relationships, sibling functions, and file imports.
         """
         try:
             results = self.graph.semantic_search(query, limit)
             if not results:
                 return "No relevant code found in the graph."
 
-            # Format for LLM consumption (Markdown)
-            report = f"### Found {len(results)} relevant code snippets for '{query}':\n\n"
+            report = f"### Found {len(results)} relevant code results for '{query}':\n\n"
             for r in results:
-                report += f"#### 📄 {r['name']} (Score: {r['score']:.2f})\n"
-                report += f"**Signature:** `{r['sig']}`\n"
+                score_display = r.get('final_score', r.get('score', 0.0))
+                report += f"#### {r['name']} (Score: {score_display:.2f})\n"
+                if r.get('sig'):
+                    report += f"**Signature:** `{r['sig']}`\n"
+                if r.get('file_path'):
+                    report += f"**File:** `{r['file_path']}`\n"
+                if r.get('calls_out'):
+                    report += f"**Calls:** {', '.join(r['calls_out'])}\n"
+                if r.get('called_by'):
+                    report += f"**Called by:** {', '.join(r['called_by'])}\n"
+                if r.get('methods'):
+                    report += f"**Methods:** {', '.join(r['methods'])}\n"
+                if r.get('siblings'):
+                    report += f"**Siblings in file:** {', '.join(r['siblings'])}\n"
+                if r.get('file_imports'):
+                    report += f"**File imports:** {', '.join(r['file_imports'])}\n"
+                if r.get('text'):
+                    report += f"```\n{r['text']}\n```\n"
+                report += "\n"
             return report
         except (neo4j.exceptions.DatabaseError, neo4j.exceptions.ClientError) as e:
             logger.error(f"search failed:{e}")
@@ -102,3 +121,41 @@ class Toolkit:
             return report
         except (neo4j.exceptions.DatabaseError, neo4j.exceptions.ClientError) as e:
             return f"Error getting commit context: {str(e)}"
+
+    def create_memory_entities(self, entities: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Create or update memory entities."""
+        return self.graph.create_memory_entities(entities)
+
+    def create_memory_relations(self, relations: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Create typed memory relations."""
+        return self.graph.create_memory_relations(relations)
+
+    def add_memory_observations(self, observations: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Append observations to memory entities."""
+        return self.graph.add_memory_observations(observations)
+
+    def delete_memory_entities(self, names: List[str]) -> Dict[str, Any]:
+        """Delete memory entities."""
+        return self.graph.delete_memory_entities(names)
+
+    def delete_memory_relations(self, relations: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Delete typed memory relations."""
+        return self.graph.delete_memory_relations(relations)
+
+    def delete_memory_observations(self, observations: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Delete observations from memory entities."""
+        return self.graph.delete_memory_observations(observations)
+
+    def search_memory_nodes(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """Search memory entities."""
+        return self.graph.search_memory_nodes(query, limit=limit)
+
+    def read_memory_graph(self) -> Dict[str, Any]:
+        """Read the current memory graph snapshot."""
+        return self.graph.read_memory_graph()
+
+    def backfill_memory_embeddings(
+        self, limit: int = 100, only_missing: bool = True
+    ) -> Dict[str, Any]:
+        """Backfill embeddings for existing memory entities."""
+        return self.graph.backfill_memory_embeddings(limit=limit, only_missing=only_missing)

@@ -64,6 +64,64 @@ def _mock_config(
     return config
 
 
+def test_update_notice_prints_when_newer_release_exists(monkeypatch, capsys):
+    """Human CLI mode should print an upgrade hint when PyPI has a newer version."""
+    args = argparse.Namespace(command="status", json=False, prompted=None, unprompted=None)
+
+    monkeypatch.setattr(cli, "_get_installed_package_version", Mock(return_value="0.1.5"))
+    monkeypatch.setattr(cli, "_get_latest_available_version", Mock(return_value="0.2.0"))
+
+    cli._maybe_emit_update_notice(args)
+
+    stdout = capsys.readouterr().out
+    assert "Update available: 0.1.5 -> 0.2.0" in stdout
+    assert "pipx upgrade agentic-codememory" in stdout
+
+
+def test_update_notice_skips_json_mode(monkeypatch, capsys):
+    """Machine-readable JSON mode should never emit a preamble notice."""
+    args = argparse.Namespace(command="status", json=True, prompted=None, unprompted=None)
+
+    monkeypatch.setattr(cli, "_get_installed_package_version", Mock(return_value="0.1.5"))
+    monkeypatch.setattr(cli, "_get_latest_available_version", Mock(return_value="0.2.0"))
+
+    cli._maybe_emit_update_notice(args)
+
+    assert capsys.readouterr().out == ""
+
+
+def test_update_notice_skips_when_disabled(monkeypatch, capsys):
+    """The opt-out environment variable should suppress network-backed notices."""
+    args = argparse.Namespace(command="status", json=False, prompted=None, unprompted=None)
+
+    monkeypatch.setenv(cli.UPDATE_CHECK_DISABLE_ENV, "1")
+    monkeypatch.setattr(cli, "_get_installed_package_version", Mock(return_value="0.1.5"))
+    monkeypatch.setattr(cli, "_get_latest_available_version", Mock(return_value="0.2.0"))
+
+    cli._maybe_emit_update_notice(args)
+
+    assert capsys.readouterr().out == ""
+
+
+def test_version_key_orders_numeric_versions():
+    """Numeric release comparison should handle common semver-style versions."""
+    assert cli._version_key("0.1.10") > cli._version_key("0.1.5")
+    assert cli._version_key("1.0.0") > cli._version_key("0.10.0")
+
+
+def test_read_update_check_cache_ignores_stale_payload(tmp_path, monkeypatch):
+    """Expired cache entries should be ignored so the CLI refreshes from PyPI."""
+    cache_file = tmp_path / "update-check.json"
+    cache_file.write_text(
+        json.dumps({"checked_at": 100.0, "latest_version": "0.2.0"}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(cli, "UPDATE_CHECK_CACHE_FILE", cache_file)
+
+    assert cli._read_update_check_cache(now=100.0 + cli.UPDATE_CHECK_CACHE_TTL_SECONDS + 1) is None
+
+
 def test_status_json_success_envelope(monkeypatch, capsys, tmp_path):
     """Status command emits deterministic JSON envelope on success."""
     repo_root = tmp_path / "repo"

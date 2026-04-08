@@ -8,6 +8,9 @@ import json
 import os
 import sys
 import time
+import urllib.error
+import urllib.request
+from importlib import metadata
 from pathlib import Path
 from typing import Any, Optional
 
@@ -18,6 +21,14 @@ from codememory.ingestion.graph import KnowledgeGraphBuilder
 from codememory.ingestion.watcher import start_continuous_watch
 from codememory.config import Config, find_repo_root, DEFAULT_CONFIG
 from codememory.telemetry import TelemetryStore, resolve_telemetry_db_path
+
+
+PACKAGE_NAME = "agentic-codememory"
+UPDATE_CHECK_TIMEOUT_SECONDS = 1.5
+UPDATE_CHECK_CACHE_TTL_SECONDS = 24 * 60 * 60
+UPDATE_CHECK_DISABLE_ENV = "CODEMEMORY_DISABLE_UPDATE_CHECK"
+UPDATE_CHECK_CACHE_DIR = Path.home() / ".codememory"
+UPDATE_CHECK_CACHE_FILE = UPDATE_CHECK_CACHE_DIR / "update-check.json"
 
 
 def print_banner():
@@ -104,6 +115,148 @@ def _emit_success(
         return False
     _emit_json(ok=True, error=None, data=data, metrics=metrics or {})
     return True
+
+
+def _get_installed_package_version() -> Optional[str]:
+    """Return the installed package version for PyPI update checks."""
+    try:
+        return metadata.version(PACKAGE_NAME)
+    except metadata.PackageNotFoundError:
+        return None
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    """Convert a dotted release string into a tuple suitable for numeric ordering.
+
+    The project currently publishes standard numeric versions like ``0.1.5`` and
+    ``0.2.0``. This helper intentionally keeps comparison logic simple and
+    dependency-free so the CLI can check PyPI without requiring ``packaging``.
+    Non-numeric segments are ignored.
+    """
+    parts = []
+    for token in version.split("."):
+        digits = "".join(ch for ch in token if ch.isdigit())
+        if digits:
+            parts.append(int(digits))
+        else:
+            parts.append(0)
+    return tuple(parts)
+
+
+def _read_update_check_cache(now: Optional[float] = None) -> Optional[dict[str, Any]]:
+    """Return a fresh cached update-check payload when available."""
+    now = now if now is not None else time.time()
+    if not UPDATE_CHECK_CACHE_FILE.exists():
+        return None
+
+    try:
+        payload = json.loads(UPDATE_CHECK_CACHE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    checked_at = payload.get("checked_at")
+    if not isinstance(checked_at, (int, float)):
+        return None
+    if now - float(checked_at) > UPDATE_CHECK_CACHE_TTL_SECONDS:
+        return None
+    return payload
+
+
+def _write_update_check_cache(latest_version: Optional[str], *, now: Optional[float] = None) -> None:
+    """Persist the most recent PyPI check result for later invocations."""
+    now = now if now is not None else time.time()
+    payload = {
+        "checked_at": now,
+        "latest_version": latest_version,
+    }
+    try:
+        UPDATE_CHECK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        UPDATE_CHECK_CACHE_FILE.write_text(json.dumps(payload), encoding="utf-8")
+    except OSError:
+        # Update notices are best-effort. Failing to write a cache should never
+        # block the command the user actually wanted to run.
+        return
+
+
+def _fetch_latest_pypi_version(timeout_seconds: float = UPDATE_CHECK_TIMEOUT_SECONDS) -> Optional[str]:
+    """Query PyPI for the latest published package version.
+
+    The CLI uses the PyPI JSON API with a short timeout so pipx-installed users
+    get a low-friction heads-up when a new release is available. Network errors
+    intentionally degrade to ``None`` rather than surfacing warnings.
+    """
+    request = urllib.request.Request(
+        url=f"https://pypi.org/pypi/{PACKAGE_NAME}/json",
+        headers={"Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (
+        TimeoutError,
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        json.JSONDecodeError,
+        OSError,
+    ):
+        return None
+
+    info = payload.get("info", {})
+    latest_version = info.get("version")
+    return latest_version if isinstance(latest_version, str) and latest_version.strip() else None
+
+
+def _get_latest_available_version() -> Optional[str]:
+    """Return the latest available release version from cache or PyPI."""
+    cached = _read_update_check_cache()
+    if cached is not None:
+        latest_version = cached.get("latest_version")
+        return latest_version if isinstance(latest_version, str) else None
+
+    latest_version = _fetch_latest_pypi_version()
+    _write_update_check_cache(latest_version)
+    return latest_version
+
+
+def _should_emit_update_notice(args: argparse.Namespace) -> bool:
+    """Return whether this invocation should print a human-facing update hint."""
+    if os.getenv(UPDATE_CHECK_DISABLE_ENV, "").strip().lower() in {"1", "true", "yes"}:
+        return False
+    if not getattr(args, "command", None):
+        return False
+    if _is_json_mode(args):
+        return False
+    if args.prompted or args.unprompted:
+        return False
+    return True
+
+
+def _maybe_emit_update_notice(args: argparse.Namespace) -> None:
+    """Print a one-line upgrade hint when PyPI has a newer release available.
+
+    The notice is intentionally:
+    - best-effort only
+    - suppressed for JSON output and annotation-only flows
+    - cached for 24 hours to avoid repeated network requests
+    """
+    if not _should_emit_update_notice(args):
+        return
+
+    installed_version = _get_installed_package_version()
+    if not installed_version:
+        return
+
+    latest_version = _get_latest_available_version()
+    if not latest_version:
+        return
+
+    if _version_key(latest_version) <= _version_key(installed_version):
+        return
+
+    print(
+        f"Update available: {installed_version} -> {latest_version}. "
+        f"Run: pipx upgrade {PACKAGE_NAME}"
+    )
 
 
 def _resolve_repo_and_config(
@@ -1240,6 +1393,8 @@ For more information, visit: https://github.com/jarmen423/codememory
             prompt_prefix=prompt_prefix,
         )
         return
+
+    _maybe_emit_update_notice(args)
 
     # Dispatch to command handlers
     if args.command == "init":

@@ -129,7 +129,7 @@ def _version_key(version: str) -> tuple[int, ...]:
     """Convert a dotted release string into a tuple suitable for numeric ordering.
 
     The project currently publishes standard numeric versions like ``0.1.5`` and
-    ``0.2.0``. This helper intentionally keeps comparison logic simple and
+    ``0.2.1``. This helper intentionally keeps comparison logic simple and
     dependency-free so the CLI can check PyPI without requiring ``packaging``.
     Non-numeric segments are ignored.
     """

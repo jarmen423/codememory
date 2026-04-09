@@ -501,7 +501,13 @@ def cmd_init(args):
 
 
 def cmd_status(args):
-    """Show status of Agentic Memory for the current repository."""
+    """Show repo-scoped graph status for the current repository.
+
+    Status intentionally reports more than the core code graph counts. The
+    system now stores code, documentation-derived chunks, and agent memory in
+    the same Neo4j database, so this command surfaces a compact breakdown that
+    helps users understand what is actually present for the active repo.
+    """
     repo_root, config = _resolve_repo_and_config(args, require_initialized=True)
     repo_name = repo_root.name or str(repo_root)
 
@@ -526,12 +532,20 @@ def cmd_status(args):
         )
 
         with builder.driver.session() as session:
-            # Get stats
+            # Status is repo-scoped when repo_id is available. That makes the
+            # command trustworthy in shared Neo4j databases where multiple repos
+            # may coexist.
             repo_params = {"repo_id": builder.repo_id} if builder.repo_id else {}
+            repo_where = "WHERE f.repo_id = $repo_id " if builder.repo_id else ""
+            file_repo_where = "WHERE entity.repo_id = $repo_id " if builder.repo_id else ""
+            memory_repo_where = "WHERE m.repo_id = $repo_id " if builder.repo_id else ""
+            docs_file_where = (
+                "WHERE f.repo_id = $repo_id AND toLower(f.path) =~ '.*\\.(md|mdx|txt|rst|adoc)$' "
+                if builder.repo_id
+                else "WHERE toLower(f.path) =~ '.*\\.(md|mdx|txt|rst|adoc)$' "
+            )
             files = session.run(
-                "MATCH (f:File) "
-                + ("WHERE f.repo_id = $repo_id " if builder.repo_id else "")
-                + "RETURN count(f) as count",
+                "MATCH (f:File) " + repo_where + "RETURN count(f) as count",
                 **repo_params,
             ).single()["count"]
             functions = session.run(
@@ -550,8 +564,61 @@ def cmd_status(args):
                 """
                 MATCH (ch:Chunk)-[:DESCRIBES]->(entity)
                 """
-                + ("WHERE entity.repo_id = $repo_id " if builder.repo_id else "")
+                + file_repo_where
                 + "RETURN count(DISTINCT ch) as count",
+                **repo_params,
+            ).single()["count"]
+            documentation_files = session.run(
+                """
+                MATCH (f:File)
+                """
+                + docs_file_where
+                + "RETURN count(f) as count",
+                **repo_params,
+            ).single()["count"]
+            documentation_chunks = session.run(
+                """
+                MATCH (ch:Chunk)-[:DESCRIBES]->(f:File)
+                """
+                + docs_file_where
+                + "RETURN count(DISTINCT ch) as count",
+                **repo_params,
+            ).single()["count"]
+            memory_entities = session.run(
+                f"MATCH (m:Memory) {memory_repo_where}RETURN count(m) as count",
+                **repo_params,
+            ).single()["count"]
+            memory_bullets = session.run(
+                """
+                MATCH (m:Memory)-[:HAS_BULLET]->(b:MemoryBullet)
+                """
+                + memory_repo_where
+                + "RETURN count(DISTINCT b) as count",
+                **repo_params,
+            ).single()["count"]
+            total_nodes = session.run(
+                """
+                CALL {
+                    MATCH (n)
+                    WHERE n.repo_id = $repo_id
+                    RETURN collect(DISTINCT n) as nodes
+                    UNION
+                    MATCH (ch:Chunk)-[:DESCRIBES]->(entity)
+                    WHERE entity.repo_id = $repo_id
+                    RETURN collect(DISTINCT ch) as nodes
+                    UNION
+                    MATCH (m:Memory)-[:HAS_BULLET]->(b:MemoryBullet)
+                    WHERE m.repo_id = $repo_id
+                    RETURN collect(DISTINCT b) as nodes
+                }
+                UNWIND nodes as node
+                RETURN count(DISTINCT node) as count
+                """
+                if builder.repo_id
+                else """
+                MATCH (n)
+                RETURN count(n) as count
+                """,
                 **repo_params,
             ).single()["count"]
 
@@ -568,10 +635,15 @@ def cmd_status(args):
             ).single()["last_updated"]
 
             stats = {
+                "total_nodes": total_nodes,
                 "files": files,
                 "functions": functions,
                 "classes": classes,
                 "chunks": chunks,
+                "memory_entities": memory_entities,
+                "memory_bullets": memory_bullets,
+                "documentation_files": documentation_files,
+                "documentation_chunks": documentation_chunks,
                 "last_sync": last_update,
             }
             if _emit_success(
@@ -586,10 +658,17 @@ def cmd_status(args):
                 return
 
             print(f"\n📈 Graph Statistics for {repo_name}:")
+            print(f"   Total nodes:          {total_nodes:,}")
             print(f"   Files:     {files:,}")
             print(f"   Functions: {functions:,}")
             print(f"   Classes:   {classes:,}")
             print(f"   Chunks:    {chunks:,}")
+            print(f"\n🧠 Memory for {repo_name}:")
+            print(f"   Memory entities:      {memory_entities:,}")
+            print(f"   Memory bullets:       {memory_bullets:,}")
+            print(f"\n📚 Documentation for {repo_name}:")
+            print(f"   Documentation files:  {documentation_files:,}")
+            print(f"   Documentation chunks: {documentation_chunks:,}")
             if last_update:
                 print(f"   Last sync: {last_update}")
             print(f"\nℹ️ To inspect another repo, run: codememory status --repo <path>")

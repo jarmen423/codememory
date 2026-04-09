@@ -140,6 +140,11 @@ def test_status_json_success_envelope(monkeypatch, capsys, tmp_path):
         _result({"count": 7}),
         _result({"count": 2}),
         _result({"count": 11}),
+        _result({"count": 4}),
+        _result({"count": 6}),
+        _result({"count": 9}),
+        _result({"count": 2}),
+        _result({"count": 27}),
         _result({"last_updated": "2026-02-01T00:00:00Z"}),
     ]
 
@@ -155,10 +160,15 @@ def test_status_json_success_envelope(monkeypatch, capsys, tmp_path):
     assert payload["metrics"] == {}
     assert payload["data"]["repository"] == str(repo_root)
     assert payload["data"]["stats"] == {
+        "total_nodes": 27,
         "files": 3,
         "functions": 7,
         "classes": 2,
         "chunks": 11,
+        "memory_entities": 9,
+        "memory_bullets": 2,
+        "documentation_files": 4,
+        "documentation_chunks": 6,
         "last_sync": "2026-02-01T00:00:00Z",
     }
     queries = [call.args[0] for call in session.run.call_args_list]
@@ -206,6 +216,11 @@ def test_status_human_output_names_active_repo(monkeypatch, capsys, tmp_path):
         _result({"count": 7}),
         _result({"count": 2}),
         _result({"count": 11}),
+        _result({"count": 4}),
+        _result({"count": 6}),
+        _result({"count": 9}),
+        _result({"count": 2}),
+        _result({"count": 27}),
         _result({"last_updated": "2026-02-01T00:00:00Z"}),
     ]
 
@@ -218,6 +233,9 @@ def test_status_human_output_names_active_repo(monkeypatch, capsys, tmp_path):
     stdout = capsys.readouterr().out
     assert "CodeMemory for m26pipeline" in stdout
     assert "Graph Statistics for m26pipeline" in stdout
+    assert "Total nodes:          27" in stdout
+    assert "Memory entities:      9" in stdout
+    assert "Documentation files:  4" in stdout
     assert "codememory status --repo <path>" in stdout
 
 
